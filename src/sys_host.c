@@ -472,6 +472,54 @@ static void send_command_to_hmi(struct sp_port* const serialport, const char* co
     wait_for_hmi_response(serialport);
 }
 
+// The 2 hex digits of the sys data length cap each message to the HMI at 255 bytes, far less than a
+// widget bitmap can take, so it goes out in bands of whole rows, each a bitmap command of its own.
+// Bands are sent in order and each replaces only its own rows, so the result is the same.
+static void send_widget_bitmap_to_hmi(struct sp_port* const serialport, const char* const msg)
+{
+    int area_id, x, y, width, height, offset = 0;
+
+    if (sscanf(msg, "%i %i %i %i %i %n", &area_id, &x, &y, &width, &height, &offset) != 5 || offset == 0)
+    {
+        fprintf(stderr, "%s: invalid message '%s'\n", __func__, msg);
+        return;
+    }
+
+    const char* const rows = msg + offset;
+    const size_t row_len = (size_t)((width + 7) / 8) * 2;
+
+    if (width <= 0 || height <= 0 || strlen(rows) < row_len * (size_t)height)
+    {
+        fprintf(stderr, "%s: invalid bitmap '%s'\n", __func__, msg);
+        return;
+    }
+
+    char band[SYS_SERIAL_SHM_DATA_SIZE];
+
+    for (int row = 0; row < height;)
+    {
+        // the header with the worst case band height, to know how many rows fit after it
+        const int header_len = snprintf(band, sizeof(band), "%i %i %i %i %i ", area_id, x, y + row, width, height);
+        const int band_rows = (int)((0xff - header_len) / row_len);
+
+        if (band_rows <= 0)
+        {
+            fprintf(stderr, "%s: bitmap rows too wide '%s'\n", __func__, msg);
+            return;
+        }
+
+        const int count = band_rows < height - row ? band_rows : height - row;
+        const int len = snprintf(band, sizeof(band), "%i %i %i %i %i ", area_id, x, y + row, width, count);
+
+        memcpy(band + len, rows + row_len * (size_t)row, row_len * (size_t)count);
+        band[len + row_len * (size_t)count] = '\0';
+
+        send_command_to_hmi(serialport, CMD_SYS_WIDGET_BITMAP, band, false);
+
+        row += count;
+    }
+}
+
 static void send_command_to_host(const sys_serial_event_type etype, const char* const value)
 {
     if (sys_host_data == NULL)
@@ -702,6 +750,13 @@ void sys_host_process(struct sp_port* const serialport)
         case sys_serial_event_type_popup:
             if (hmi_command_cache_add(page, subpage, etype, msg))
                 send_command_to_hmi(serialport, CMD_SYS_LAUNCH_POPUP, msg, false);
+            break;
+        // widgets are not cached: the plugin redraws its whole area every time it comes into view
+        case sys_serial_event_type_widget_bitmap:
+            send_widget_bitmap_to_hmi(serialport, msg);
+            break;
+        case sys_serial_event_type_widget_clear:
+            send_command_to_hmi(serialport, CMD_SYS_WIDGET_CLEAR, msg, false);
             break;
         default:
             break;
