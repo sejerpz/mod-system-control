@@ -4,6 +4,7 @@
 
 #include "sys_host.h"
 #include "cli.h"
+#include "reply.h"
 #include "serial_rw.h"
 
 #include "../mod-controller-proto/mod-protocol.h"
@@ -390,6 +391,45 @@ static void hmi_command_cache_remove(const uint8_t page, uint8_t subpage, char m
     }
 }
 
+// Waits for the HMI to answer a command sent to it. The HMI may send a command of its own in the
+// meantime, a page change say, and it may be blocked until that one is answered: such a command is
+// handled right here, as the main loop would, instead of being taken for the response and dropped.
+static void wait_for_hmi_response(struct sp_port* const serialport)
+{
+    char buf[0xff];
+
+    for (;;)
+    {
+        // generous: the HMI can be busy redrawing, and a response missed here comes late into the main loop
+        const int ret = serial_read_message(serialport, buf, 500);
+
+        if (ret == SP_READ_ERROR_NO_DATA || ret == SP_READ_ERROR_IO)
+        {
+            fprintf(stderr, "%s: no response from the HMI\n", __func__);
+            return;
+        }
+
+        if (ret < 0)
+            continue;
+
+        if (buf[0] == 'r' && buf[1] == ' ')
+            return;
+
+        if (strncmp(buf, _CMD_SYS_PREFIX, strlen(_CMD_SYS_PREFIX)) == 0)
+        {
+            if (s_debug)
+            {
+                fprintf(stdout, "handling '%s' from the HMI while waiting for a response\n", buf);
+                fflush(stdout);
+            }
+            parse_and_reply_to_message(serialport, buf, s_debug);
+            continue;
+        }
+
+        fprintf(stderr, "%s: ignoring '%s' while waiting for a response\n", __func__, buf);
+    }
+}
+
 static void send_command_to_hmi(struct sp_port* const serialport, const char* const sys_cmd,
                                 char msg[SYS_SERIAL_SHM_DATA_SIZE], const bool quoted)
 {
@@ -429,7 +469,7 @@ static void send_command_to_hmi(struct sp_port* const serialport, const char* co
     write_or_close(serialport, msg);
 
     // response
-    serial_read_ignore_until_zero(serialport);
+    wait_for_hmi_response(serialport);
 }
 
 static void send_command_to_host(const sys_serial_event_type etype, const char* const value)

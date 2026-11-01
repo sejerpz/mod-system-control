@@ -24,6 +24,13 @@ sp_read_error_status serial_read_msg_until_zero(struct sp_port* serialport, char
 // returns 0 if ok, otherwise an error
 sp_read_error_status serial_read_ignore_until_zero(struct sp_port* serialport);
 
+// Reads one whole message, everything up to its null byte, whatever it is: a command or a response.
+// Waits up to `timeout_ms` for it to start, then a short while per byte.
+// Returns the message length, or an error; a message too long for `buf` is skipped and reported invalid.
+// TODO: serial_read_msg_until_zero() could be this plus the sys_ format checks, but it leaves the rest of an
+// invalid message for serial_read_ignore_until_zero(), and test.c checks that; test-fake does not link either.
+int serial_read_message(struct sp_port* serialport, char buf[0xff], int timeout_ms);
+
 // returns false on IO error, which will automatically close the serial
 bool write_or_close(struct sp_port* serialport, const char* msg);
 
