@@ -391,10 +391,29 @@ static void hmi_command_cache_remove(const uint8_t page, uint8_t subpage, char m
     }
 }
 
+// Whether a message is one of the protocol errors of the HMI ("not found" for a command it does not
+// know, a firmware without the HMI widgets say). Without arguments the HMI cuts a message on the system
+// line to _CMD_SYS_LENGTH characters ("not fou"): a prefix of the error counts.
+static bool is_hmi_protocol_error(const char* const buf)
+{
+    static const char* const errors[] = {
+        RESP_ERR_COMMAND_NOT_FOUND, RESP_ERR_MANY_ARGUMENTS, RESP_ERR_FEW_ARGUMENTS, RESP_ERR_INVALID_ARGUMENT
+    };
+    const size_t len = strlen(buf);
+
+    for (size_t i = 0; len != 0 && i < sizeof(errors) / sizeof(errors[0]); ++i)
+        if (strncmp(buf, errors[i], len) == 0)
+            return true;
+
+    return false;
+}
+
 // Waits for the HMI to answer a command sent to it. The HMI may send a command of its own in the
 // meantime, a page change say, and it may be blocked until that one is answered: such a command is
 // handled right here, as the main loop would, instead of being taken for the response and dropped.
-static void wait_for_hmi_response(struct sp_port* const serialport)
+// A protocol error is the answer too, reported once per command: waiting on would stall every command
+// the HMI does not know, and mod-host behind them.
+static void wait_for_hmi_response(struct sp_port* const serialport, const char* const sys_cmd)
 {
     char buf[0xff];
 
@@ -414,6 +433,24 @@ static void wait_for_hmi_response(struct sp_port* const serialport)
 
         if (buf[0] == 'r' && buf[1] == ' ')
             return;
+
+        if (is_hmi_protocol_error(buf))
+        {
+            static char reported[16][_CMD_SYS_LENGTH + 1];
+            static unsigned int reported_count;
+            bool known = false;
+
+            for (unsigned int i = 0; i < reported_count && ! known; ++i)
+                known = strncmp(reported[i], sys_cmd, _CMD_SYS_LENGTH) == 0;
+
+            if (! known)
+            {
+                fprintf(stderr, "%s: the HMI answers '%s' to %.*s\n", __func__, buf, _CMD_SYS_LENGTH, sys_cmd);
+                if (reported_count < sizeof(reported) / sizeof(reported[0]))
+                    snprintf(reported[reported_count++], sizeof(reported[0]), "%.*s", _CMD_SYS_LENGTH, sys_cmd);
+            }
+            return;
+        }
 
         if (strncmp(buf, _CMD_SYS_PREFIX, strlen(_CMD_SYS_PREFIX)) == 0)
         {
@@ -469,7 +506,7 @@ static void send_command_to_hmi(struct sp_port* const serialport, const char* co
     write_or_close(serialport, msg);
 
     // response
-    wait_for_hmi_response(serialport);
+    wait_for_hmi_response(serialport, sys_cmd);
 }
 
 // The 2 hex digits of the sys data length cap each message to the HMI at 255 bytes, far less than a
