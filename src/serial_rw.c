@@ -206,6 +206,36 @@ sp_read_error_status serial_read_ignore_until_zero(struct sp_port* serialport)
     }
 }
 
+int serial_read_message(struct sp_port* const serialport, char buf[0xff], const int timeout_ms)
+{
+    unsigned int len = 0;
+    enum sp_return ret;
+
+    for (;;)
+    {
+        ret = sp_blocking_read(serialport, buf + len, 1, len == 0 ? timeout_ms : SP_BLOCKING_READ_TIMEOUT);
+
+        if (ret < 0)
+            return SP_READ_ERROR_IO;
+        if (ret == 0)
+            return len == 0 ? SP_READ_ERROR_NO_DATA : SP_READ_ERROR_INVALID_DATA;
+
+        if (buf[len] == '\0')
+        {
+            // stray null bytes between messages
+            if (len == 0)
+                continue;
+            return (int)len;
+        }
+
+        if (++len == 0xff - 1)
+        {
+            serial_read_ignore_until_zero(serialport);
+            return SP_READ_ERROR_INVALID_DATA;
+        }
+    }
+}
+
 bool write_or_close(struct sp_port* serialport, const char* const msg)
 {
     errno = 0;

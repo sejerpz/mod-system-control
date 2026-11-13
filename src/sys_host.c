@@ -4,6 +4,7 @@
 
 #include "sys_host.h"
 #include "cli.h"
+#include "reply.h"
 #include "serial_rw.h"
 
 #include "../mod-controller-proto/mod-protocol.h"
@@ -390,8 +391,109 @@ static void hmi_command_cache_remove(const uint8_t page, uint8_t subpage, char m
     }
 }
 
-static void send_command_to_hmi(struct sp_port* const serialport, const char* const sys_cmd,
-                                char msg[SYS_SERIAL_SHM_DATA_SIZE], const bool quoted)
+// Whether a message is one of the protocol errors of the HMI ("not found" for a command it does not
+// know, a firmware without the HMI widgets say). Without arguments the HMI cuts a message on the system
+// line to _CMD_SYS_LENGTH characters ("not fou"): a prefix of the error counts.
+static bool is_hmi_protocol_error(const char* const buf)
+{
+    static const char* const errors[] = {
+        RESP_ERR_COMMAND_NOT_FOUND, RESP_ERR_MANY_ARGUMENTS, RESP_ERR_FEW_ARGUMENTS, RESP_ERR_INVALID_ARGUMENT
+    };
+    const size_t len = strlen(buf);
+
+    for (size_t i = 0; len != 0 && i < sizeof(errors) / sizeof(errors[0]); ++i)
+        if (strncmp(buf, errors[i], len) == 0)
+            return true;
+
+    return false;
+}
+
+// Waits for the HMI to answer a command sent to it. The HMI may send a command of its own in the
+// meantime, a page change say, and it may be blocked until that one is answered: such a command is
+// handled right here, as the main loop would, instead of being taken for the response and dropped.
+// A protocol error is the answer too, reported once per command: waiting on would stall every command
+// the HMI does not know, and mod-host behind them.
+static void wait_for_hmi_response(struct sp_port* const serialport, const char* const sys_cmd)
+{
+    char buf[0xff];
+
+    for (;;)
+    {
+        // generous: the HMI can be busy redrawing, and a response missed here comes late into the main loop
+        const int ret = serial_read_message(serialport, buf, 500);
+
+        if (ret == SP_READ_ERROR_NO_DATA || ret == SP_READ_ERROR_IO)
+        {
+            fprintf(stderr, "%s: no response from the HMI\n", __func__);
+            return;
+        }
+
+        if (ret < 0)
+            continue;
+
+        if (buf[0] == 'r' && buf[1] == ' ')
+            return;
+
+        if (is_hmi_protocol_error(buf))
+        {
+            static char reported[16][_CMD_SYS_LENGTH + 1];
+            static unsigned int reported_count;
+            bool known = false;
+
+            for (unsigned int i = 0; i < reported_count && ! known; ++i)
+                known = strncmp(reported[i], sys_cmd, _CMD_SYS_LENGTH) == 0;
+
+            if (! known)
+            {
+                fprintf(stderr, "%s: the HMI answers '%s' to %.*s\n", __func__, buf, _CMD_SYS_LENGTH, sys_cmd);
+                if (reported_count < sizeof(reported) / sizeof(reported[0]))
+                    snprintf(reported[reported_count++], sizeof(reported[0]), "%.*s", _CMD_SYS_LENGTH, sys_cmd);
+            }
+            return;
+        }
+
+        if (strncmp(buf, _CMD_SYS_PREFIX, strlen(_CMD_SYS_PREFIX)) == 0)
+        {
+            if (s_debug)
+            {
+                fprintf(stdout, "handling '%s' from the HMI while waiting for a response\n", buf);
+                fflush(stdout);
+            }
+            parse_and_reply_to_message(serialport, buf, s_debug);
+            continue;
+        }
+
+        fprintf(stderr, "%s: ignoring '%s' while waiting for a response\n", __func__, buf);
+    }
+}
+
+// Widget bitmaps and clears go out without waiting for the answer to the one before, up to this many
+// unanswered at a time: the HMI handles a band in less time than the band takes on the line, while the
+// answer to each one takes several ms to come back. Measured on the Duo X: 7.6 ms per band waiting for
+// each answer, 1.9 ms with two in flight, the time of a band on the line at 1500000 baud. The HMI takes
+// them in its 4 KB receive buffer. Every other command waits for the pending answers, then for its own.
+#define HMI_WIDGET_WINDOW 3
+
+static const char* hmi_pending[HMI_WIDGET_WINDOW];
+static unsigned int hmi_pending_count;
+
+// the answer to the oldest command still unanswered
+static void wait_for_pending_hmi_response(struct sp_port* const serialport)
+{
+    wait_for_hmi_response(serialport, hmi_pending[0]);
+
+    --hmi_pending_count;
+    memmove(hmi_pending, hmi_pending + 1, hmi_pending_count * sizeof(hmi_pending[0]));
+}
+
+static void wait_for_pending_hmi_responses(struct sp_port* const serialport)
+{
+    while (hmi_pending_count != 0)
+        wait_for_pending_hmi_response(serialport);
+}
+
+static void write_command_to_hmi(struct sp_port* const serialport, const char* const sys_cmd,
+                                 char msg[SYS_SERIAL_SHM_DATA_SIZE], const bool quoted)
 {
     const uint8_t len = strlen(msg);
     const size_t msg_offset = _CMD_SYS_LENGTH + _CMD_SYS_DATA_LENGTH + 2 /* spaces */ + (quoted ? 1 : 0);
@@ -427,9 +529,77 @@ static void send_command_to_hmi(struct sp_port* const serialport, const char* co
 
     // write message
     write_or_close(serialport, msg);
+}
+
+static void send_command_to_hmi(struct sp_port* const serialport, const char* const sys_cmd,
+                                char msg[SYS_SERIAL_SHM_DATA_SIZE], const bool quoted)
+{
+    wait_for_pending_hmi_responses(serialport);
+
+    write_command_to_hmi(serialport, sys_cmd, msg, quoted);
 
     // response
-    serial_read_ignore_until_zero(serialport);
+    wait_for_hmi_response(serialport, sys_cmd);
+}
+
+// a widget command, answered later (see HMI_WIDGET_WINDOW)
+static void send_widget_command_to_hmi(struct sp_port* const serialport, const char* const sys_cmd,
+                                       char msg[SYS_SERIAL_SHM_DATA_SIZE])
+{
+    if (hmi_pending_count == HMI_WIDGET_WINDOW)
+        wait_for_pending_hmi_response(serialport);
+
+    write_command_to_hmi(serialport, sys_cmd, msg, false);
+
+    hmi_pending[hmi_pending_count++] = sys_cmd;
+}
+
+// The 2 hex digits of the sys data length cap each message to the HMI at 255 bytes, far less than a
+// widget bitmap can take, so it goes out in bands of whole rows, each a bitmap command of its own.
+// Bands are sent in order and each replaces only its own rows, so the result is the same.
+static void send_widget_bitmap_to_hmi(struct sp_port* const serialport, const char* const msg)
+{
+    int area_id, x, y, width, height, offset = 0;
+
+    if (sscanf(msg, "%i %i %i %i %i %n", &area_id, &x, &y, &width, &height, &offset) != 5 || offset == 0)
+    {
+        fprintf(stderr, "%s: invalid message '%s'\n", __func__, msg);
+        return;
+    }
+
+    const char* const rows = msg + offset;
+    const size_t row_len = (size_t)((width + 7) / 8) * 2;
+
+    if (width <= 0 || height <= 0 || strlen(rows) < row_len * (size_t)height)
+    {
+        fprintf(stderr, "%s: invalid bitmap '%s'\n", __func__, msg);
+        return;
+    }
+
+    char band[SYS_SERIAL_SHM_DATA_SIZE];
+
+    for (int row = 0; row < height;)
+    {
+        // the header with the worst case band height, to know how many rows fit after it
+        const int header_len = snprintf(band, sizeof(band), "%i %i %i %i %i ", area_id, x, y + row, width, height);
+        const int band_rows = (int)((0xff - header_len) / row_len);
+
+        if (band_rows <= 0)
+        {
+            fprintf(stderr, "%s: bitmap rows too wide '%s'\n", __func__, msg);
+            return;
+        }
+
+        const int count = band_rows < height - row ? band_rows : height - row;
+        const int len = snprintf(band, sizeof(band), "%i %i %i %i %i ", area_id, x, y + row, width, count);
+
+        memcpy(band + len, rows + row_len * (size_t)row, row_len * (size_t)count);
+        band[len + row_len * (size_t)count] = '\0';
+
+        send_widget_command_to_hmi(serialport, CMD_SYS_WIDGET_BITMAP, band);
+
+        row += count;
+    }
 }
 
 static void send_command_to_host(const sys_serial_event_type etype, const char* const value)
@@ -663,6 +833,13 @@ void sys_host_process(struct sp_port* const serialport)
             if (hmi_command_cache_add(page, subpage, etype, msg))
                 send_command_to_hmi(serialport, CMD_SYS_LAUNCH_POPUP, msg, false);
             break;
+        // widgets are not cached: the plugin redraws its whole area every time it comes into view
+        case sys_serial_event_type_widget_bitmap:
+            send_widget_bitmap_to_hmi(serialport, msg);
+            break;
+        case sys_serial_event_type_widget_clear:
+            send_widget_command_to_hmi(serialport, CMD_SYS_WIDGET_CLEAR, msg);
+            break;
         default:
             break;
         }
@@ -673,6 +850,9 @@ void sys_host_process(struct sp_port* const serialport)
             fflush(stdout);
         }
     }
+
+    // nothing left from the host: the answers come here, not to the main loop
+    wait_for_pending_hmi_responses(serialport);
 }
 
 void sys_host_destroy(void)

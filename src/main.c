@@ -80,17 +80,29 @@ int main(int argc, char* argv[])
 
     while (g_running)
     {
-        switch (serial_read_msg_until_zero(serialport, buf, debug))
-        {
-        case SP_READ_ERROR_NO_DATA:
-            process_postponed_messages(serialport);
-            continue;
-        case SP_READ_ERROR_INVALID_DATA:
-            serial_read_ignore_until_zero(serialport);
-            process_postponed_messages(serialport);
-            continue;
-        case SP_READ_ERROR_IO:
+        // Whole messages up to their null byte. Reading a fixed-size head first would swallow the start of
+        // a command right behind a response the HMI sent late, after the wait for it was over, and the
+        // HMI would then wait forever for the answer to that command.
+        const int ret = serial_read_message(serialport, buf, 40);
+
+        if (ret == SP_READ_ERROR_IO)
             break;
+
+        if (ret < 0)
+        {
+            process_postponed_messages(serialport);
+            continue;
+        }
+
+        // a response that came after its wait was over, nothing left to do with it
+        if (buf[0] == 'r' && buf[1] == ' ')
+        {
+            if (debug)
+            {
+                fprintf(stdout, "mod-system-control ignoring late response '%s'\n", buf);
+                fflush(stdout);
+            }
+            continue;
         }
 
         if (debug)
